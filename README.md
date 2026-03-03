@@ -28,8 +28,11 @@ source activate ./env
    pip install -r requirements.txt
    ```
 
-3. Replace the environment variable in `.env` file
-    Add the MongoDB environment variable in the `.env` file
+3. Create or update the `.env` file at the project root with the MongoDB connection string:
+   ```ini
+   MONGO_DB_URL=mongodb+srv://<username>:<password>@cluster0.example.mongodb.net/?retryWrites=true&w=majority
+   ```
+   You can also set this variable directly in your shell if you prefer.
 
 4. Run the Streamlit application:
    ```bash

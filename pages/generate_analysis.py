@@ -5,7 +5,13 @@ from src.constants import SESSION_PRODUCT_KEY
 from src.utils import fetch_product_names_from_cloud
 from src.data_report.generate_data_report import DashboardGenerator
 
-mongo_con = MongoIO()
+# Initialize the MongoIO connection but handle missing configuration gracefully
+try:
+    mongo_con = MongoIO()
+except Exception as e:
+    # if the environment isn't configured the page should still load
+    mongo_con = None
+    init_error = str(e)
 
 
 def create_analysis_page(review_data: pd.DataFrame):
@@ -25,8 +31,11 @@ def create_analysis_page(review_data: pd.DataFrame):
 try:
 
     if st.session_state.data:
-        data = mongo_con.get_reviews(product_name=st.session_state[SESSION_PRODUCT_KEY])
-        create_analysis_page(data)
+        if mongo_con is None:
+            st.error(f"Unable to connect to database: {init_error}")
+        else:
+            data = mongo_con.get_reviews(product_name=st.session_state[SESSION_PRODUCT_KEY])
+            create_analysis_page(data)
 
     else:
         with st.sidebar:
