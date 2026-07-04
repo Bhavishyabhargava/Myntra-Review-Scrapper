@@ -1,12 +1,8 @@
 import pandas as pd
 from database_connect import mongo_operation as mongo
 import os, sys
-from dotenv import load_dotenv
 from src.constants import *
 from src.exception import CustomException
-
-# load environment variables from a .env file if present
-load_dotenv()
 
 
 class MongoIO:
@@ -15,12 +11,8 @@ class MongoIO:
     def __init__(self):
         if MongoIO.mongo_ins is None:
             mongo_db_url = os.getenv(MONGODB_URL_KEY)
-            if not mongo_db_url:
-                # more descriptive message for users
-                raise Exception(
-                    f"Configuration error: environment variable '{MONGODB_URL_KEY}' is not set. "
-                    "You can provide it via a .env file or your shell environment."
-                )
+            if mongo_db_url is None:
+                raise Exception(f"Environment key: {MONGODB_URL_KEY} is not set.")
             MongoIO.mongo_ins = mongo(client_url=mongo_db_url,
                                       database_name=MONGO_DATABASE_NAME)
         self.mongo_ins = MongoIO.mongo_ins

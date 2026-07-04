@@ -1,4 +1,3 @@
-from flask import request
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from src.exception import CustomException
@@ -8,6 +7,11 @@ import os, sys
 import time
 from selenium.webdriver.chrome.options import Options
 from urllib.parse import quote
+import re
+from urllib.parse import urlparse
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, WebDriverException
 
 
 class ScrapeReviews:
@@ -15,67 +19,177 @@ class ScrapeReviews:
                  product_name:str,
                  no_of_products:int):
         options = Options()
-        # options.add_argument("--no-sandbox")
-        # options.add_argument("--disable-dev-shm-usage")
-        # options.add_argument('--headless')
+        # Enable headless mode for cloud deployment
+        options.add_argument("--headless")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--window-size=1920,1080")
+        options.add_argument("--disable-web-resources")
+        options.add_argument("--disable-images")  # Don't load images to save bandwidth
+        # Make the browser less detectable as automation
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation"]) 
+        options.add_experimental_option('useAutomationExtension', False)
+        options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36")
         
         # Start a new Chrome browser session
-        self.driver = webdriver.Chrome(options=options)
+        try:
+            self.driver = webdriver.Chrome(options=options)
+        except WebDriverException as e:
+            raise CustomException(e, sys)
+        # Try to further mask automation
+        try:
+            self.driver.execute_cdp_cmd(
+                "Page.addScriptToEvaluateOnNewDocument",
+                {
+                    "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+                },
+            )
+        except Exception:
+            pass
 
         self.product_name = product_name
         self.no_of_products = no_of_products
 
     def scrape_product_urls(self, product_name):
         try:
-            search_string = product_name.replace(" ","-")
-            # no_of_products = int(self.request.form['prod_no'])
+            # Use Myntra search endpoint
+            encoded_query = quote(product_name)
+            search_url = f"https://www.myntra.com/search?q={encoded_query}"
+            self.driver.get(search_url)
 
-            encoded_query = quote(search_string)
-            # Navigate to the URL
-            self.driver.get(
-                f"https://www.myntra.com/{search_string}?rawQuery={encoded_query}"
-            )
-            myntra_text = self.driver.page_source
-            myntra_html = bs(myntra_text, "html.parser")
-            pclass = myntra_html.findAll("ul", {"class": "results-base"})
-
+            # Wait for search results to load and scroll to load more items
             product_urls = []
-            for i in pclass:
-                href = i.find_all("a", href=True)
+            try:
+                WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "li.product-base, ul.results-base, div.product-grid"))
+                )
+            except TimeoutException:
+                # fallback to parsing whatever is available
+                pass
 
-                for product_no in range(len(href)):
-                    t = href[product_no]["href"]
-                    product_urls.append(t)
+            # Scroll a few times to let dynamic content load
+            for _ in range(6):
+                try:
+                    self.driver.execute_script("window.scrollBy(0, 1500);")
+                    time.sleep(1.2)
+                except Exception:
+                    break
 
-            return product_urls
+            page_html = bs(self.driver.page_source, "html.parser")
+            # First try extracting product URLs from JSON-LD structured data
+            import json
+            json_urls = []
+            for script in page_html.find_all("script", {"type": "application/ld+json"}):
+                try:
+                    txt = script.string or script.get_text()
+                    payload = json.loads(txt)
+                except Exception:
+                    continue
+                # Look for ItemList structures
+                if isinstance(payload, dict) and payload.get("@type") == "ItemList":
+                    for item in payload.get("itemListElement", []):
+                        if isinstance(item, dict):
+                            url = item.get("url") or (item.get("item") or {}).get("@id")
+                            if url:
+                                # normalize to path
+                                if url.startswith("http"):
+                                    json_urls.append(urlparse(url).path)
+                                else:
+                                    json_urls.append(url)
+
+            # If we found JSON-LD URLs, use them first
+            if json_urls:
+                product_urls = json_urls
+            else:
+                product_urls = []
+
+            # Try common Myntra selectors in order of preference
+            selectors = [
+                "a.desktop-searchLink",
+                "a.product-base",
+                "li.product-base a",
+                "ul.results-base a",
+                "a[href*='/']",
+            ]
+
+            for sel in selectors:
+                links = page_html.select(sel)
+                for a in links:
+                    href = a.get("href")
+                    if href and href.startswith("/"):
+                        product_urls.append(href)
+
+            # deduplicate while preserving order
+            seen = set()
+            unique_urls = []
+            for u in product_urls:
+                if u not in seen:
+                    seen.add(u)
+                    unique_urls.append(u)
+
+            # Filter likely product pages: require any path segment to contain digits
+            filtered = []
+            for u in unique_urls:
+                path = urlparse(u).path if u.startswith('http') or u.startswith('/') else urlparse(u).path
+                segments = [seg for seg in path.split('/') if seg]
+                if any(any(ch.isdigit() for ch in seg) for seg in segments):
+                    filtered.append(u)
+
+            return filtered
 
         except Exception as e:
             raise CustomException(e, sys)
 
     def extract_reviews(self, product_link):
         try:
-            productLink = "https://www.myntra.com/" + product_link
+            productLink = "https://www.myntra.com" + product_link
             self.driver.get(productLink)
-            prodRes = self.driver.page_source
-            prodRes_html = bs(prodRes, "html.parser")
-            title_h = prodRes_html.findAll("title")
 
-            self.product_title = title_h[0].text
+            # Wait for page to load key elements
+            try:
+                WebDriverWait(self.driver, 8).until(
+                    EC.presence_of_element_located((By.TAG_NAME, "title"))
+                )
+            except TimeoutException:
+                pass
 
-            overallRating = prodRes_html.findAll(
+            prodRes_html = bs(self.driver.page_source, "html.parser")
+
+            title_tag = prodRes_html.find("title")
+            self.product_title = title_tag.text.strip() if title_tag else ""
+
+            overallRating = prodRes_html.find(
                 "div", {"class": "index-overallRating"}
             )
-            for i in overallRating:
-                self.product_rating_value = i.find("div").text
-            price = prodRes_html.findAll("span", {"class": "pdp-price"})
-            for i in price:
-                self.product_price = i.text
-            product_reviews = prodRes_html.find(
-                "a", {"class": "detailed-reviews-allReviews"}
-            )
+            if overallRating:
+                inner = overallRating.find("div")
+                self.product_rating_value = inner.text.strip() if inner else ""
+            else:
+                self.product_rating_value = ""
+
+            price_tag = prodRes_html.find("span", {"class": "pdp-price"})
+            self.product_price = price_tag.text.strip() if price_tag else ""
+
+            # Look for review page link using multiple fallbacks
+            product_reviews = None
+            # Common anchor classes or href patterns
+            candidates = prodRes_html.select("a.detailed-reviews-allReviews, a[href*='product-reviews'], a[href*='reviews']")
+            if candidates:
+                product_reviews = candidates[0]
+
+            # If not found, try to locate by text
+            if not product_reviews:
+                for a in prodRes_html.find_all("a", href=True):
+                    href = a["href"]
+                    if "review" in href or "reviews" in href:
+                        product_reviews = a
+                        break
 
             if not product_reviews:
                 return None
+
             return product_reviews
         except Exception as e:
             raise CustomException(e, sys)
@@ -107,7 +221,11 @@ class ScrapeReviews:
 
     def extract_products(self, product_reviews: list):
         try:
-            t2 = product_reviews["href"]
+            # product_reviews can be a bs4 Tag; get href safely
+            t2 = product_reviews.get("href") if hasattr(product_reviews, 'get') else None
+            if not t2:
+                return pd.DataFrame()
+
             Review_link = "https://www.myntra.com" + t2
             self.driver.get(Review_link)
             
@@ -199,27 +317,31 @@ class ScrapeReviews:
 
             product_details = []
 
-            review_len = 0
+            # Iterate over available product URLs and collect reviews until
+            # we've gathered the requested number or run out of URLs.
+            for product_url in product_urls:
+                if len(product_details) >= self.no_of_products:
+                    break
 
-
-            while review_len < self.no_of_products:
-                product_url = product_urls[review_len]
                 review = self.extract_reviews(product_url)
 
                 if review:
                     product_detail = self.extract_products(review)
-                    product_details.append(product_detail)
+                    if product_detail is not None and not product_detail.empty:
+                        product_details.append(product_detail)
 
-                    review_len += 1
-                else:
-                    product_urls.pop(review_len)
+            # Ensure the webdriver is closed
+            try:
+                self.driver.quit()
+            except Exception:
+                pass
 
-            self.driver.quit()
+            if not product_details:
+                # Return empty DataFrame if nothing was scraped
+                return pd.DataFrame()
 
-            data = pd.concat(product_details, axis=0)
-            
+            data = pd.concat(product_details, axis=0, ignore_index=True)
             data.to_csv("data.csv", index=False)
-            
             return data
             
             
